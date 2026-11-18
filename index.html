@@ -90,6 +90,7 @@ button.tc{cursor:pointer}
 @keyframes vira{from{transform:perspective(500px) rotateX(-88deg);opacity:0}to{transform:none;opacity:1}}
 @media (prefers-reduced-motion:reduce){.boot .tile{animation:none}}
 
+.aviso.erro{background:color-mix(in srgb,var(--alerta) 13%,var(--surface));border-color:var(--alerta)}
 .aviso{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap;background:color-mix(in srgb,var(--ouro) 22%,var(--surface));border:1px solid color-mix(in srgb,var(--ouro) 55%,var(--line));border-radius:var(--r);padding:12px 16px;font-size:14px}
 
 .cols{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.15fr);gap:16px;align-items:start}
@@ -265,13 +266,17 @@ const CORES=['#1638a8','#d9480f','#0b7a75','#8f2d8f','#b07d00','#c2255c','#4263e
 
 /* ============ armazenamento (navegador + conta Claude quando disponível) ============ */
 const LS='placar-habitos-v1';
-let DB={}, dirty={}, col=null, memo={}, synced=false, PREVIEW=false;
-function lsSave(){try{localStorage.setItem(LS,JSON.stringify(Object.values(DB)))}catch(e){}}
+let DB={}, dirty={}, col=null, memo={}, synced=false;
+/* CARREGANDO: no Claude, espera a conta responder antes de criar qualquer coisa. SEMEADO: sugestões criadas sem resposta da conta.
+   TOCADO: a pessoa já alterou algo nesta abertura. LSOK: o navegador aceitou gravar. */
+let CARREGANDO=false, SEMEADO=false, SEMEANDO=false, TOCADO=false, LSOK=true;
+const SEMENTES=['hab_s0','hab_s1','hab_s2','hab_s3','cfg'];
+function lsSave(){try{localStorage.setItem(LS,JSON.stringify(Object.values(DB)));LSOK=true}catch(e){LSOK=false}}
 function lsLoad(){try{const a=JSON.parse(localStorage.getItem(LS)||'[]');for(const o of a)if(o&&o.id)DB[o.id]=o}catch(e){}}
 const clean=o=>JSON.parse(JSON.stringify(o));
 const stable=v=>Array.isArray(v)?'['+v.map(stable).join(',')+']':v&&typeof v==='object'?'{'+Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+stable(v[k])).join(',')+'}':JSON.stringify(v);
-function put(o){o=clean(o);DB[o.id]=o;memo={};if(PREVIEW)return;dirty[o.id]=o;lsSave();queue(o.id)}
-function del(id){delete DB[id];memo={};if(PREVIEW)return;dirty[id]=null;lsSave();queue(id)}
+function put(o){o=clean(o);DB[o.id]=o;memo={};dirty[o.id]=o;if(!SEMEANDO)TOCADO=true;lsSave();queue(o.id)}
+function del(id){delete DB[id];memo={};dirty[id]=null;TOCADO=true;lsSave();queue(id)}
 const Q=new Set(); let flushing=false, fails=0;
 function queue(id){if(!col)return;Q.add(id);flush()}
 async function flush(){
@@ -292,28 +297,43 @@ async function flush(){
     }
   }finally{flushing=false}
 }
+/* primeira abertura: hábitos sugeridos, valendo a partir de hoje e já gravados (não existe modo de exemplo) */
+function semear(){
+  const t=today(); SEMEANDO=true;
+  [['Estudar antes do trabalho','days',[0,1,2,3,4]],['Aula de BT','days',[1,3]],['Ler 20 minutos','daily',[]],['Banho do Potter','days',[5]]]
+    .forEach(([name,freq,days],i)=>put({id:'hab_s'+i,t:'hab',name,freq,days,times:3,target:1,unit:'',color:CORES[i],start:t,order:i}));
+  put({id:'cfg',t:'cfg',aviso:1}); SEMEANDO=false;
+}
 async function connectDb(){
+  if(STANDALONE)return;
+  let timer=null;
+  const local=()=>{clearTimeout(timer);if(CARREGANDO){CARREGANDO=false;semear();SEMEADO=true}render()};   /* sem resposta da conta: segue gravando no navegador */
   try{
-    if(STANDALONE)return;
+    timer=setTimeout(local,10000);
     const [db,user]=await Promise.all([claude.use('db'),claude.use('user')]);
-    if(!db||!user)return; const id=await user.id(); if(!id)return;
+    if(!db||!user)return local(); const id=await user.id(); if(!id)return local();
     const c=db.collection('data/users/'+id); let first=true;
     c.onSnapshot(snap=>{
       const fresh=!snap.metadata.fromCache; if(first&&!fresh&&snap.empty)return; let force=false;
       if(first&&fresh){
-        first=false; col=c; synced=true; force=true;
-        if(snap.empty&&!PREVIEW&&Object.keys(DB).length){for(const o of Object.values(DB)){dirty[o.id]=o;Q.add(o.id)} flush(); render(); return}
+        first=false; clearTimeout(timer); col=c; synced=true; force=true;
+        if(snap.empty){                                   /* conta vazia: primeira vez, ou dados que só existiam neste navegador */
+          if(CARREGANDO){CARREGANDO=false;semear()} else for(const o of Object.values(DB)){dirty[o.id]=o;Q.add(o.id)}
+          SEMEADO=false; flush(); render(); return;
+        }
+        if(SEMEADO&&!TOCADO)for(const k of SEMENTES){delete DB[k];delete dirty[k]}   /* a conta já tinha dados: saem as sugestões criadas enquanto ela não respondia */
+        SEMEADO=false;
         for(const k of Object.keys(dirty))Q.add(k); flush();
       }
       if(!col)col=c;
       const next={}; for(const d of snap.docs){const v=d.data();if(v)next[d.id]=clean(v)}
       for(const [k,v] of Object.entries(dirty)){if(v)next[k]=v;else delete next[k]}
       const ka=Object.keys(next);
-      if(PREVIEW){if(!ka.length){if(force)render();return} PREVIEW=false;force=true}
+      if(CARREGANDO){if(!ka.length)return;CARREGANDO=false;force=true}
       if(!force&&ka.length===Object.keys(DB).length&&ka.every(k=>DB[k]&&stable(DB[k])===stable(next[k])))return;
       DB=next; memo={}; lsSave(); render();
-    },()=>{synced=false;render()});
-  }catch(e){console.warn(e)}
+    },()=>{synced=false;local()});
+  }catch(e){console.warn(e);local()}
 }
 
 /* ============ regras ============ */
@@ -474,10 +494,16 @@ function vMeses(){
     <div class="meses">${out.map(o=>`<div class="${o.atual?'atual':''}"><b class="num">${o.r==null?'':o.r+'%'}</b><i style="height:${o.r==null?0:Math.max(2,o.r)}%"></i>${MES3[o.m-1]}</div>`).join('')}</div>
     <p class="dica" style="margin-top:10px">Parte do que estava programado e foi feito. O dia de hoje só entra quando o hábito é marcado.</p></section>`;
 }
-function vAviso(){return PREVIEW?`<div class="aviso"><div><b>Sugestão de escalação com histórico de exemplo.</b> Nada foi salvo ainda. Ao começar, o histórico zera e a meta de 100 dias abre hoje.</div><div class="btns"><button class="btn pri" data-act="pv-usar">Começar com estes hábitos</button><button class="btn" data-act="pv-zero">Começar em branco</button></div></div>`:''}
+function vAviso(){
+  let h='';
+  if(!LSOK&&!synced)h+=`<div class="aviso erro" role="alert"><div><b>Este navegador não está guardando seus dados.</b> O que você marcar some ao fechar a página. Abra fora da navegação privada ou libere o armazenamento deste site. Enquanto isso, copie um backup em Backup e dados.</div></div>`;
+  if(DB.cfg&&DB.cfg.aviso)h+=`<div class="aviso"><div><b>Já está valendo: tudo o que você marcar fica salvo.</b> Começamos com quatro hábitos sugeridos, a partir de hoje. Edite, arquive ou exclua cada um pela tabela.</div><div class="btns"><button class="btn pri" data-act="av-ok">Entendi</button><button class="btn" data-act="av-zero">Começar em branco</button></div></div>`;
+  return h;
+}
 function render(){
   memo={}; const m=$('#main'); const sx=$('#heat-wrap')?.scrollLeft;
-  m.innerHTML=vCapa()+vAviso()+`<div class="cols">${vRodada()}${vSemana()}</div>`+vTemporada()+`<div class="cols larga">${vTabela()}${vMeses()}</div>
+  m.innerHTML=CARREGANDO?vCapa()+`<section class="card vazio" aria-live="polite">Carregando seus hábitos…</section>`
+    :vCapa()+vAviso()+`<div class="cols">${vRodada()}${vSemana()}</div>`+vTemporada()+`<div class="cols larga">${vTabela()}${vMeses()}</div>
     <footer class="rod"><span class="${synced?'on':''}"><i></i>${synced?'Sincronizado na sua conta Claude':'Salvo neste navegador'}</span><span><button class="link" data-act="dados">Backup e dados</button></span></footer>`;
   const hw=$('#heat-wrap'); if(hw)hw.scrollLeft=sx==null?hw.scrollWidth:sx;
   fitMotto();
@@ -540,7 +566,7 @@ function metaModal(){
 function arquivadosModal(){const a=habs(true).filter(h=>h.archived);openModal(mh('Hábitos arquivados')+`<div class="modal-b">${a.map(h=>`<div class="hb" style="--hc:${h.color}"><span style="width:12px;height:12px;border-radius:50%;background:${h.color}"></span><div><b>${esc(h.name)}</b><small>arquivado em ${dm(h.end||today())} · ${totalFeitos(h)} feitos</small></div><button class="btn sm" data-act="editar" data-id="${h.id}">Abrir</button></div>`).join('')||'<p>Nenhum hábito arquivado.</p>'}</div><div class="modal-f"><button class="btn" data-act="fechar">Fechar</button></div>`)}
 const backupText=()=>JSON.stringify({app:'placar-habitos',v:1,at:new Date().toISOString(),items:Object.values(DB)});
 function restaurar(txt){let j;try{j=JSON.parse(txt)}catch(_){return toast('Backup inválido')}const items=Array.isArray(j)?j:j&&j.items;if(!Array.isArray(items)||!items.every(o=>o&&o.id&&['hab','log','cfg'].includes(o.t)))return toast('Backup inválido');
-  confirmar(`Restaurar ${items.length} itens? Itens com o mesmo identificador serão substituídos.`,'Restaurar',()=>{if(PREVIEW){PREVIEW=false;DB={};memo={}}for(const o of items)put(o);render();toast('Backup restaurado')})}
+  confirmar(`Restaurar ${items.length} itens? Itens com o mesmo identificador serão substituídos.`,'Restaurar',()=>{for(const o of items)put(o);render();toast('Backup restaurado')})}
 function dadosModal(){
   openModal(mh('Backup e dados')+`<div class="modal-b"><p class="dica">${synced?'Seus hábitos ficam na sua conta Claude, visíveis só para você, e acompanham você no celular e no computador.':'Seus hábitos estão salvos neste navegador.'}</p>
     <div class="btns">${STANDALONE?'<button class="btn pri" id="bk-baixar">Baixar backup</button>':''}<button class="btn" id="bk-copiar">Copiar backup</button></div>
@@ -551,25 +577,13 @@ function dadosModal(){
   if($('#bk-baixar'))$('#bk-baixar').onclick=()=>{const l=document.createElement('a');l.href=URL.createObjectURL(new Blob([backupText()],{type:'application/json'}));l.download='placar-habitos-'+today()+'.json';document.body.appendChild(l);l.click();l.remove();toast('Backup baixado')};
   $('#bk-arq').onchange=e=>{const f=e.target.files[0];if(f)f.text().then(restaurar)};
   $('#bk-rest').onclick=()=>restaurar($('#bk-txt').value);
-  $('#bk-zerar').onclick=()=>confirmar('Apagar <b>todos</b> os hábitos e o histórico? Não dá para desfazer.','Apagar tudo',()=>{PREVIEW=false;for(const id of Object.keys(DB))del(id);render()});
-}
-
-/* ============ sugestão inicial (não é salva até você escolher) ============ */
-function sugestao(){
-  const t=today(), start=addDays(weekStart(t),-30*7);
-  const H=[['Estudar antes do trabalho','days',[0,1,2,3,4],.52],['Aula de BT','days',[1,3],.8],['Ler 20 minutos','daily',[],.45],['Banho do Potter','days',[5],.86]];
-  let s=11; const rnd=()=>{s=(s*1103515245+12345)&0x7fffffff;return s/0x7fffffff}, span=Math.max(1,ddiff(start,t));
-  H.forEach(([name,freq,days,base],i)=>{ const h={id:'hab_s'+i,t:'hab',name,freq,days,times:3,target:1,unit:'',color:CORES[i],start,order:i}; DB[h.id]=h;
-    for(let d=start;d<t;d=addDays(d,1)){ if(!programado(h,d))continue; const p=Math.min(.97,base+.42*ddiff(start,d)/span);
-      if(rnd()<p){const id='log_'+h.id+'_'+d.slice(0,7);(DB[id]||(DB[id]={id,t:'log',hab:h.id,ym:d.slice(0,7),d:{}})).d[d.slice(8)]=1} } });
-  DB.cfg={id:'cfg',t:'cfg',meta:{dias:100,ini:addDays(t,-61)}};
-  memo={};
+  $('#bk-zerar').onclick=()=>confirmar('Apagar <b>todos</b> os hábitos e o histórico? Não dá para desfazer.','Apagar tudo',()=>{for(const id of Object.keys(DB))del(id);put({id:'cfg',t:'cfg',aviso:0});render()});   /* o marcador evita que as sugestões voltem */
 }
 
 /* ============ eventos ============ */
 const H=id=>DB[id];
 document.addEventListener('click',e=>{
-  const el=e.target.closest('[data-act]'); if(!el)return; const a=el.dataset.act, h=el.dataset.id&&H(el.dataset.id), t=today();
+  const el=e.target.closest('[data-act]'); if(!el||CARREGANDO)return; const a=el.dataset.act, h=el.dataset.id&&H(el.dataset.id), t=today();
   switch(a){
     case 'fechar':closeModal();break;
     case 'tap':if(h){setCnt(h,U.day,feito(h,U.day)?0:alvo(h));render()}break;
@@ -585,14 +599,18 @@ document.addEventListener('click',e=>{
     case 'arquivados':arquivadosModal();break;
     case 'dados':dadosModal();break;
     case 'meta':metaModal();break;
-    case 'pv-usar':{const hs=habs(true);PREVIEW=false;DB={};memo={};hs.forEach((x,i)=>put({...x,id:uid('hab'),start:t,order:i}));render();toast('Meta de 100 dias aberta. Boa rodada!');break}
-    case 'pv-zero':PREVIEW=false;DB={};memo={};lsSave();render();habModal();break;
+    case 'av-ok':put({...DB.cfg,aviso:0});render();break;
+    case 'av-zero':confirmar('Remover os hábitos sugeridos, com o que foi marcado neles, e começar em branco?','Começar em branco',()=>{
+      for(const o of Object.values(DB))if(o.t==='hab'&&/^hab_s\d$/.test(o.id)){for(const l of L('log'))if(l.hab===o.id)del(l.id);del(o.id)}
+      put({...(DB.cfg||{id:'cfg',t:'cfg'}),aviso:0});render();habModal()});break;
   }
 });
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&$('#modal-bg').classList.contains('open'))closeModal()});
 $('#modal-bg').addEventListener('mousedown',e=>{if(e.target.id==='modal-bg')closeModal()});
 
-lsLoad(); if(!Object.keys(DB).length){PREVIEW=true;sugestao()} render(); connectDb();
+lsLoad(); try{localStorage.setItem(LS+'-teste','1');localStorage.removeItem(LS+'-teste')}catch(e){LSOK=false}
+if(!Object.keys(DB).length){if(STANDALONE)semear();else CARREGANDO=true}   /* fora do Claude começa já; dentro, só depois de a conta responder */
+render(); connectDb();
 if(document.fonts&&document.fonts.ready)document.fonts.ready.then(fitMotto);
 let rsz; addEventListener('resize',()=>{clearTimeout(rsz);rsz=setTimeout(fitMotto,120)});
 </script>
